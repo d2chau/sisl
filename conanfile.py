@@ -3,13 +3,14 @@ from conan.errors import ConanInvalidConfiguration
 from conan.tools.build import check_min_cppstd
 from conan.tools.cmake import CMakeToolchain, CMakeDeps, CMake
 from conan.tools.files import copy
+from conan.tools.scm import Version
 from os.path import join
 
 required_conan_version = ">=2.0"
 
 class SISLConan(ConanFile):
     name = "sisl"
-    version = "14.4.0"
+    version = "14.4.1"
 
     homepage = "https://github.com/eBay/sisl"
     description = "Library for fast data structures, utilities"
@@ -52,6 +53,15 @@ class SISLConan(ConanFile):
     def _min_cppstd(self):
         return 23
 
+    def _use_breakpad(self):
+        # breakpad/cci.20210521 is frozen (2021) and fails to build with gcc >= 16; keep it for the
+        # other Linux/libstdc++ toolchains it does support.
+        if self.settings.os not in ["Linux"] or self.settings.compiler.get_safe("libcxx") == "libc++":
+            return False
+        if self.settings.compiler == "gcc" and Version(self.settings.compiler.version) >= "16":
+            return False
+        return True
+
     def validate(self):
         if self.settings.compiler.get_safe("cppstd"):
             check_min_cppstd(self, self._min_cppstd())
@@ -83,8 +93,11 @@ class SISLConan(ConanFile):
         self.requires("nlohmann_json/3.12.0", transitive_headers=True)
         self.requires("spdlog/1.17.0", transitive_headers=True)
         self.requires("zmarok-semver/1.1.0", transitive_headers=True)
+        # Public sisl/async coroutine headers (task.hpp/when_all.hpp) include <exec/...>; ship stdexec
+        # transitively so package consumers resolve it without their own FetchContent.
+        self.requires("stdexec/25.09", transitive_headers=True)
         self.requires("lz4/1.10.0", override=True)
-        if self.settings.os in ["Linux"] and self.settings.compiler.get_safe("libcxx") != "libc++":
+        if self._use_breakpad():
             self.requires("breakpad/cci.20210521")
 
         # ARM needs unreleased versionof libunwind
@@ -237,7 +250,7 @@ class SISLConan(ConanFile):
                 "nlohmann_json::nlohmann_json",
                 "spdlog::spdlog",
                 ])
-        if self.settings.os in ["Linux"] and self.settings.compiler.get_safe("libcxx") != "libc++":
+        if self._use_breakpad():
             self.cpp_info.components["logging"].requires.append("breakpad::breakpad")
         self.cpp_info.components["sobject"].requires.extend([
                 "logging",
@@ -251,7 +264,9 @@ class SISLConan(ConanFile):
                 "logging",
                 "zmarok-semver::zmarok-semver",
                 ])
-        sisl_requires = ["sobject", "version"]
+        # sisl/async coroutine headers (task.hpp/when_all.hpp) include <exec/...>; the umbrella component
+        # carries the dependency so consumers of sisl::sisl resolve stdexec.
+        sisl_requires = ["sobject", "version", "stdexec::stdexec"]
         if self.settings.os in ["Linux"]:
             sisl_requires.append("file_watcher")
         self.cpp_info.components["sisl"].requires.extend(sisl_requires)
