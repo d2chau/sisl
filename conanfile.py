@@ -10,7 +10,7 @@ required_conan_version = ">=2.0"
 
 class SISLConan(ConanFile):
     name = "sisl"
-    version = "14.6.0"
+    version = "14.6.1"
 
     homepage = "https://github.com/eBay/sisl"
     description = "Library for fast data structures, utilities"
@@ -82,9 +82,10 @@ class SISLConan(ConanFile):
                     raise ConanInvalidConfiguration("Coverage/Sanitizer requires Testing!")
 
     def build_requirements(self):
-        self.test_requires("gtest/1.17.0")
-        if self.options.metrics:
-            self.test_requires("benchmark/1.9.5")
+        if not self.conf.get("tools.build:skip_test", default=False):
+            self.test_requires("gtest/1.17.0")
+            if self.options.metrics:
+                self.test_requires("benchmark/1.9.5")
 
     def requirements(self):
         # Required
