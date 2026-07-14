@@ -26,6 +26,14 @@ if(BUILD_TESTING)
 
     find_package(stdexec QUIET)
     if (TARGET stdexec::stdexec)
+        # light_task itself is header-only and dependency-free (stderr backstop log), but its test also
+        # covers the light_task overloads of when_all/when_quorum, whose headers include stdexec for the
+        # exec::task forms -- so the test binary is gated with the stdexec group.
+        add_executable(test_light_task)
+        target_sources(test_light_task PRIVATE tests/test_light_task.cpp)
+        target_link_libraries(test_light_task PRIVATE stdexec::stdexec GTest::gtest GTest::gtest_main)
+        add_test(NAME LightTask COMMAND test_light_task)
+
         add_executable(test_cqe_awaitable)
         target_sources(test_cqe_awaitable PRIVATE
             tests/test_cqe_awaitable.cpp

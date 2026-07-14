@@ -31,6 +31,7 @@
 #include <stdexec/execution.hpp>
 #include <exec/inline_scheduler.hpp>
 
+#include <sisl/async/light_task.hpp>
 #include <sisl/async/task.hpp>
 #include <sisl/async/value_awaitable.hpp>
 
@@ -64,6 +65,19 @@ task< void > fan_run_one(task< T > child, std::shared_ptr< std::vector< T > > re
     latch->count_down();
 }
 
+// light_task twin of fan_run_one. No scheduler to inject or suppress: .detach() starts it inline and every
+// resume happens on the thread that completes the child.
+template < typename T >
+light_task< void > light_fan_run_one(light_task< T > child, std::shared_ptr< std::vector< T > > results,
+                                     std::size_t index, std::shared_ptr< fan_latch > latch) {
+    try {
+        (*results)[index] = co_await std::move(child);
+    } catch (...) {
+        // leave results[index] default-constructed
+    }
+    latch->count_down();
+}
+
 } // namespace detail
 
 // Start every task concurrently; complete once all have finished, returning results in input order.
@@ -77,6 +91,23 @@ task< std::vector< T > > when_all(std::vector< task< T > > tasks) {
     for (std::size_t i = 0; i < n; ++i) {
         stdexec::start_detached(stdexec::write_env(detail::fan_run_one< T >(std::move(tasks[i]), results, i, latch),
                                                    stdexec::prop{stdexec::get_scheduler, exec::inline_scheduler{}}));
+    }
+    co_await latch->_done;
+    co_return std::move(*results);
+}
+
+// light_task overload: same latch, same errors-as-values model, same per-index threading contract. Each child
+// runs synchronously to its first suspension inside this loop (detach() resumes inline), so caller-owned
+// payloads need only survive the loop, exactly like the exec::task form.
+template < typename T >
+light_task< std::vector< T > > when_all(std::vector< light_task< T > > tasks) {
+    auto const n = tasks.size();
+    auto results = std::make_shared< std::vector< T > >(n);
+    if (n == 0) { co_return std::move(*results); }
+
+    auto latch = std::make_shared< detail::fan_latch >(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        detail::light_fan_run_one< T >(std::move(tasks[i]), results, i, latch).detach();
     }
     co_await latch->_done;
     co_return std::move(*results);

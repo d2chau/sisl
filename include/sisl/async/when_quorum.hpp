@@ -31,6 +31,7 @@
 #include <exec/inline_scheduler.hpp>
 #include <stdexec/execution.hpp>
 
+#include <sisl/async/light_task.hpp>
 #include <sisl/async/task.hpp>
 #include <sisl/async/value_awaitable.hpp>
 
@@ -84,6 +85,24 @@ task< void > quorum_run_one(task< T > child, std::shared_ptr< std::vector< T > >
     latch->arrive(acked);
 }
 
+// light_task twin of quorum_run_one. Started via .detach() -- fire-and-forget is what lets a straggler keep
+// running (self-owning frame) after the quorum-th success resumed the awaiter.
+template < typename T >
+light_task< void > light_quorum_run_one(light_task< T > child, std::shared_ptr< std::vector< T > > results,
+                                        std::size_t index, std::shared_ptr< quorum_latch > latch,
+                                        completion_hook on_each) {
+    bool acked = false;
+    try {
+        auto r = co_await std::move(child);
+        acked = r.has_value();
+        (*results)[index] = std::move(r);
+    } catch (...) {
+        // leave results[index] default-constructed; counted as a non-success
+    }
+    if (on_each) on_each(index, acked);
+    latch->arrive(acked);
+}
+
 } // namespace detail
 
 template < typename T >
@@ -112,6 +131,24 @@ task< quorum_result< T > > when_quorum(std::vector< task< T > > tasks, std::size
         stdexec::start_detached(
             stdexec::write_env(detail::quorum_run_one< T >(std::move(tasks[i]), results, i, latch, on_each),
                                stdexec::prop{stdexec::get_scheduler, exec::inline_scheduler{}}));
+    }
+    co_await latch->done;
+    co_return quorum_result< T >{latch->acks.load(std::memory_order_acquire), std::move(results)};
+}
+
+// light_task overload: identical semantics (payload contract, results race, straggler detachment). Each child
+// runs synchronously to its first suspension inside this loop -- .detach() resumes inline, no scheduler to
+// suppress.
+template < typename T >
+light_task< quorum_result< T > > when_quorum(std::vector< light_task< T > > tasks, std::size_t quorum,
+                                             detail::completion_hook on_each = {}) {
+    auto const n = tasks.size();
+    auto results = std::make_shared< std::vector< T > >(n);
+    if (n == 0) co_return quorum_result< T >{0, std::move(results)};
+
+    auto latch = std::make_shared< detail::quorum_latch >(n, quorum);
+    for (std::size_t i = 0; i < n; ++i) {
+        detail::light_quorum_run_one< T >(std::move(tasks[i]), results, i, latch, on_each).detach();
     }
     co_await latch->done;
     co_return quorum_result< T >{latch->acks.load(std::memory_order_acquire), std::move(results)};

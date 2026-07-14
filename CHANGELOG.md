@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [14.8.0] - 2026-07-13
+- Added `sisl::async::light_task<T>` (+ `light_result`/`light_status`): a freestanding, stdexec-free lazy
+  coroutine task — plain awaitable from any coroutine, exception-capturing, with `.detach()` fire-and-forget
+  and a blocking `sync_get` bridge. Resumption is always inline on the completing thread (no scheduler).
+- Added `light_task` overloads of `when_all` / `when_quorum` (same latches and semantics as the exec::task
+  forms), plus first direct unit coverage for the combinators.
+
 ## [14.7.0] - 2026-06-04
 - Added new generic sisl::result generic type
 - Added new generic when_quorum async reactor
