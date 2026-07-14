@@ -8,8 +8,8 @@
 //
 // Built on the tested value_awaitable cross-thread handshake (a counting latch) + start_detached with
 // an inline scheduler -- the same pattern iomgr's drive launcher uses (io_launch.hpp): exec::task has
-// sticky scheduler affinity, so write_env injects exec::inline_scheduler to start a detached task that
-// resumes inline on whatever thread completes it.
+// sticky scheduler affinity, so write_env injects stdexec::inline_scheduler to start a detached task
+// that resumes inline on whatever thread completes it.
 //
 // ERROR MODEL: errors-as-values. Each child task is expected to complete on its value channel with a T
 // (e.g. a Result<...> that may hold an error). when_all does NOT short-circuit on a child error (unlike
@@ -29,8 +29,6 @@
 #include <vector>
 
 #include <stdexec/execution.hpp>
-#include <exec/inline_scheduler.hpp>
-
 #include <sisl/async/light_task.hpp>
 #include <sisl/async/task.hpp>
 #include <sisl/async/value_awaitable.hpp>
@@ -90,7 +88,7 @@ task< std::vector< T > > when_all(std::vector< task< T > > tasks) {
     auto latch = std::make_shared< detail::fan_latch >(n);
     for (std::size_t i = 0; i < n; ++i) {
         stdexec::start_detached(stdexec::write_env(detail::fan_run_one< T >(std::move(tasks[i]), results, i, latch),
-                                                   stdexec::prop{stdexec::get_scheduler, exec::inline_scheduler{}}));
+                                                   stdexec::prop{stdexec::get_scheduler, stdexec::inline_scheduler{}}));
     }
     co_await latch->_done;
     co_return std::move(*results);
