@@ -20,6 +20,7 @@ A C++23 library of high-performance data structures, utilities, and infrastructu
   - [Cache](#cache)
   - [Settings](#settings)
   - [Flip — Fault Injection](#flip--fault-injection)
+  - [Async](#async)
   - [gRPC Utilities](#grpc-utilities)
   - [Auth Manager](#auth-manager)
   - [Utility](#utility)
@@ -252,6 +253,70 @@ fc.inject_retval< int >("write_io_error", -EIO);
 ```
 
 Supports boolean flips, return-value injection, async delay injection, callback flips, parameterized conditions, and frequency control (N times, every Nth, X% probability). See [src/flip/README.md](src/flip/README.md).
+
+### Async
+
+C++20 coroutine primitives for structured async code without callback chains. Organized in two dependency tiers: a **stdexec-free** baseline that works with any C++20 compiler, and a **stdexec-aware** tier that integrates with P2300 execution contexts (`exec::task`, stop tokens, schedulers).
+
+**Coroutine task types:**
+
+| Type | Tier | Description |
+|---|---|---|
+| `light_task<T>` | Stdexec-free | Lazy stackless coroutine. Runs inline on whichever thread resumes it. Awaitable from any coroutine; supports `.detach()` for fire-and-forget. |
+| `disk_task<T>` + `hot_task<T>` | Stdexec-free | io_uring-oriented task. `.start()` submits the SQE and returns a `hot_task` to `co_await` later, enabling SQE batch fan-out. |
+| `task<T>` | Stdexec | Alias for `exec::task<T>`. Scheduler-affine, also a P2300 sender; composes with `when_all`, `when_any`, stop tokens. |
+
+**Awaitable bridges** convert callback-style completions into `co_await`-able expressions:
+
+| Type | Consumers | Transfer |
+|---|---|---|
+| `value_awaitable<T>` | Single | Move (move-only `T` supported) |
+| `shared_awaitable<T>` | Many (broadcast) | Copy (all waiters get a copy) |
+| `cqe_awaitable` | Single | `int` (io_uring `cqe->res`) |
+
+**Fan-out combinators** work on both `light_task` and `task` vectors:
+
+- `when_all(vector<Ts>)` - resolves when all tasks complete; results preserved in input order.
+- `when_quorum(tasks, k)` - resolves when `k` tasks succeed, or all tasks finish. Stragglers continue running detached.
+
+```cpp
+// light_task: runs inline on whichever thread resumes it; no scheduler required
+sisl::async::light_task<int> fetch_value(Source& src) {
+    co_return co_await src.next();
+}
+
+// Blocking bridge from synchronous context:
+int val = sisl::async::sync_get(fetch_value(src));
+
+// Fire-and-forget (exceptions are logged and swallowed):
+std::move(my_task).detach();
+
+// value_awaitable: bridge a callback into co_await (single consumer, move semantics)
+auto av = std::make_shared<sisl::async::value_awaitable<Result>>();
+some_async_op([av](Result r) { av->complete(std::move(r)); });
+auto result = co_await *av;
+
+// shared_awaitable: broadcast one result to N waiting coroutines (copy semantics)
+auto shared = std::make_shared<sisl::async::shared_awaitable<Store*>>();
+shared->complete(opened_store);           // producer (any thread)
+auto* store = co_await *shared;          // each consumer gets a copy
+
+// when_quorum: k-of-n fan-out (resolves when 3 of 5 writes succeed)
+std::vector<sisl::async::light_task<sisl::result<void>>> writes;
+for (auto& peer : peers) writes.push_back(write_to(peer, data));
+auto qr = co_await sisl::async::when_quorum(std::move(writes), /*quorum=*/3);
+if (qr.acks < 3) { /* quorum not met */ }
+```
+
+`sisl::result<T>` (`std::expected<T, std::error_condition>`) is the synchronous error vocabulary. Convenience aliases for coroutine contexts:
+
+```cpp
+// light_result<T>  = light_task<sisl::result<T>>
+// light_status     = light_task<sisl::result<std::monostate>>
+sisl::async::light_result<Page> load_page(uint64_t id) {
+    // co_return a sisl::result<Page>
+}
+```
 
 ### gRPC Utilities
 
