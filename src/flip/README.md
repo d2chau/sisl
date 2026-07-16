@@ -382,24 +382,24 @@ Parameters are:
 
 ### Inject APIs
 ```c++
-bool inject_noreturn_flip(std::string flip_name, const std::vector< FlipCondition >& conditions, const FlipFrequency &freq);
+bool inject_noreturn_flip(std::string flip_name, std::span< const FlipCondition > conditions, const FlipFrequency &freq);
 
 template <typename T>
-bool inject_retval_flip(std::string flip_name, const std::vector< FlipCondition >& conditions,
+bool inject_retval_flip(std::string flip_name, std::span< const FlipCondition > conditions,
                         const FlipFrequency& freq, const T& retval);
                          
-bool inject_delay_flip(std::string flip_name, const std::vector< FlipCondition >& conditions,
+bool inject_delay_flip(std::string flip_name, std::span< const FlipCondition > conditions,
                       const FlipFrequency& freq, uint64_t delay_usec);
 template <typename T>
-bool inject_delay_and_retval_flip(std::string flip_name, const std::vector< FlipCondition >& conditions,
+bool inject_delay_and_retval_flip(std::string flip_name, std::span< const FlipCondition > conditions,
                                   const FlipFrequency &freq, uint64_t delay_usec, const T& retval);
 
 template <typename... Args>
-bool inject_callback_flip(std::string flip_name, const std::vector< FlipCondition >& conditions,
+bool inject_callback_flip(std::string flip_name, std::span< const FlipCondition > conditions,
                          const FlipFrequency& freq, std::function<void(Args...)> callback);
 
 template <typename T, typename... Args>
-bool inject_callback_retval_flip(std::string flip_name, const std::vector< FlipCondition >& conditions,
+bool inject_callback_retval_flip(std::string flip_name, std::span< const FlipCondition > conditions,
                                 const FlipFrequency& freq, std::function<T(Args...)> callback);
 ```
 
@@ -428,7 +428,7 @@ Example code
     
     FlipFrequency freq;
     freq.set_count(2); freq.set_percent(100);
-    fclient.inject_delay_flip("delay_flip", {cond1, cond2}, freq, 100000 /* delay in usec */);
+    fclient.inject_delay_flip("delay_flip", std::vector{cond1, cond2}, freq, 100000 /* delay in usec */);
 ```
 Above examples, trigger a flip called delay flip to inject a delay of 100ms if cmd_type == 1 and size_bytes <= 2048
 

@@ -126,18 +126,15 @@ public:
         REGISTER_HISTOGRAM(latency_us, "Latency in microseconds");
         register_me_to_farm();
     }
-    DECL_COUNTER(requests);
-    DECL_GAUGE(queue_depth);
-    DECL_HISTOGRAM(latency_us);
 };
 
 MyMetrics m{"instance1"};
-COUNTER_INCREMENT(m, requests);
+COUNTER_INCREMENT(m, requests, 1);
 GAUGE_UPDATE(m, queue_depth, q.size());
 HISTOGRAM_OBSERVE(m, latency_us, elapsed_us);
 ```
 
-See [src/metrics/README.md](src/metrics/README.md) for internals and histogram bucket configuration.
+Metrics are keyed by the name passed to `REGISTER_*` in the constructor and referenced by that same name in the update macros — there are no per-metric member declarations. See [src/metrics/README.md](src/metrics/README.md) for internals and histogram bucket configuration.
 
 ### WISR — Wait-free Inserts, Snoozy Reads
 
@@ -148,13 +145,13 @@ Benchmarks: **10–12× better write throughput vs. `std::mutex`** on 8 threads.
 Ships with ready-to-use containers:
 
 ```cpp
-sisl::wisr_vector< Request > pending;
+sisl::wisr_vector< Request > pending{1024};   // ctor takes an initial capacity hint
 
 // Writers (any thread, wait-free):
 pending.push_back(req);
 
 // Reader (periodic flush):
-auto snapshot = pending.now();   // drains all threads into a local vector
+auto snapshot = pending.now();   // rotates + merges all thread buffers, returns the combined container
 for (auto& r : *snapshot) { process(r); }
 ```
 
@@ -169,8 +166,8 @@ Concurrent, dynamically-resizable bitset with bulk operations. Unlike `std::bits
 ```cpp
 sisl::Bitset bs(1024);
 bs.set_bit(42);
-auto next = bs.get_next_set_bit(0);   // → 42
-bs.serialize(buf);
+auto next = bs.get_next_set_bit(0);        // → 42
+sisl::byte_array buf = bs.serialize();     // returns a serialized byte_array (optional alignment arg)
 ```
 
 #### StreamTracker
@@ -179,8 +176,8 @@ Tracks a stream of in-flight integer-keyed operations and computes the contiguou
 
 ```cpp
 sisl::StreamTracker< MyState > tracker;
-tracker.create(seq, state);       // register in-flight op
-tracker.complete(seq);            // mark done
+tracker.create(seq, state);            // register in-flight op
+tracker.complete(seq, seq);            // mark the [start, end] range done
 auto upto = tracker.completed_upto();  // highest contiguous completion
 ```
 
@@ -194,7 +191,7 @@ Thread-local free-list allocator for fixed-size objects. Pre-allocates a slab pe
 
 ```cpp
 auto* obj = sisl::ObjectAllocator< MyObj >::make_object(args...);
-sisl::ObjectAllocator< MyObj >::free_object(obj);
+sisl::ObjectAllocator< MyObj >::deallocate(obj);
 ```
 
 #### ConcurrentInsertVector
@@ -215,13 +212,22 @@ scatter.emplace_back(buf);
 
 ### Cache
 
-An LRU evictor and range-aware concurrent hashmap built on top of FDS primitives. Supports point and range lookups, pluggable eviction callbacks, and configurable bucket counts.
+An LRU evictor and a **range-aware** concurrent hashmap built on top of FDS primitives. `RangeHashMap< K >` keys a base key together with a `[nth, count)` sub-range, stores `io_blob` values, and carves out the requested sub-range on lookup via a caller-supplied *value extractor*.
 
 ```cpp
-sisl::RangeHashMap< uint64_t, Page > cache(num_buckets);
-cache.insert(key, page);
-auto result = cache.get(key);
-cache.remove_range(start_key, end_key);
+// Extractor slices a stored blob down to the requested [nth, count) sub-range:
+auto extractor = [](const sisl::byte_view& v, uint32_t nth, uint32_t count) {
+    return sisl::byte_view{v, nth * kValSize, count * kValSize};
+};
+sisl::RangeHashMap< uint32_t > cache{num_buckets, extractor};
+
+// Insert base key 1 covering offsets [0, 10):
+cache.insert(sisl::RangeKey< uint32_t >{1u, 0, 10}, blob);
+
+// Look up a sub-range; returns the covering (RangeKey, byte_view) pairs:
+auto entries = cache.get(sisl::RangeKey< uint32_t >{1u, 2, 4});
+
+cache.erase(sisl::RangeKey< uint32_t >{1u, 0, 10});
 ```
 
 ### Settings
@@ -229,12 +235,20 @@ cache.remove_range(start_key, end_key);
 Flatbuffers-backed runtime configuration with hot-swap support. Define a schema, generate C++ accessors at build time, and get thread-safe near-zero-cost config reads at runtime — without recompiling to change a tuning knob.
 
 ```cpp
-// Generated from schema.fbs via cmake/settings_gen.cmake:
-auto& cfg = Settings::instance().get();
-auto timeout = cfg.network().connect_timeout_ms();
+// One-time wiring binding the generated schema to a factory singleton:
+// SETTINGS_INIT(<namespace>::<SettingsName>, <SchemaName>)
+SETTINGS_INIT(myapp::MyAppSettings, myapp_config)
 
-// Hot-reload from file or string:
-Settings::instance().reload("/etc/myapp/config.json");
+// Read a single value (thread-safe, ~local-variable cost):
+auto timeout = SETTINGS_VALUE(myapp_config, config->network->connect_timeout_ms);
+
+// Read several fields atomically under one lock:
+SETTINGS(myapp_config, s, {
+    connect(s.config.network.host, s.config.network.connect_timeout_ms);
+});
+
+// Hot-reload from a JSON file or string; returns true if a restart is required:
+SETTINGS_FACTORY(myapp_config).reload_file("/etc/myapp/config.json");
 ```
 
 Supports hot-swappable (live reload) and cold (restart-required) settings in the same schema. See [src/settings/README.md](src/settings/README.md).
@@ -244,19 +258,27 @@ Supports hot-swappable (live reload) and cold (restart-required) settings in the
 A gRPC-backed fault injection framework for testing failure scenarios without recompilation. Instrument code with named flip points; trigger faults externally via gRPC, Python client, or a local `FlipClient` in unit tests.
 
 ```cpp
-// In production code:
-FLIP_POINT("write_io_error");
+// In production code — a named injection point (returns true when the fault fires):
+if (flip::Flip::instance().test_flip("write_io_error")) { return -EIO; }
 
-// In tests:
-FlipClient fc(FlipRPCClient::instance());
-fc.inject_retval< int >("write_io_error", -EIO);
+// ...or inject a value to return at the point:
+if (auto v = flip::Flip::instance().get_test_flip< int >("write_delay_ms")) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(*v));
+}
+
+// In tests — arm the flip via a FlipClient bound to the Flip instance:
+flip::FlipClient fc(&flip::Flip::instance());
+flip::FlipFrequency freq;
+freq.set_count(2);        // fire at most twice
+freq.set_percent(100);    // on every matching call
+fc.inject_retval_flip< int >("write_delay_ms", /*conditions=*/{}, freq, 500);
 ```
 
 Supports boolean flips, return-value injection, async delay injection, callback flips, parameterized conditions, and frequency control (N times, every Nth, X% probability). See [src/flip/README.md](src/flip/README.md).
 
 ### Async
 
-C++20 coroutine primitives for structured async code without callback chains. Organized in two dependency tiers: a **stdexec-free** baseline that works with any C++20 compiler, and a **stdexec-aware** tier that integrates with P2300 execution contexts (`exec::task`, stop tokens, schedulers).
+C++23 coroutine primitives for structured async code without callback chains. Organized in two dependency tiers: a **stdexec-free** baseline with no dependency beyond the standard library, and a **stdexec-aware** tier that integrates with P2300 execution contexts (`exec::task`, stop tokens, schedulers).
 
 **Coroutine task types:**
 
@@ -337,17 +359,34 @@ if (!result) { LOGERROR("RPC failed: {}", result.error().error_message()); }
 stub->call_unary< EchoRequest, EchoReply >(req,
     &EchoService::StubInterface::AsyncEcho,
     [](EchoReply& reply, grpc::Status& s) { /* handle */ }, 5);
+
+// Async client — coroutine (generic stub): co_await a reply instead of blocking on a future
+auto gstub = client->make_generic_stub("worker-1");
+sisl::async::light_task< void > send(sisl::io_blob_list_t req) {
+    GrpcResult< GenericClientResponse > result =
+        co_await gstub->call_unary_co(req, "/EchoService/Echo", /*deadline_s=*/5);
+    if (!result) { LOGERROR("RPC failed: {}", result.error().error_message()); }
+    // On success, result->response_blob() yields the reply bytes as a sisl::io_blob.
+}
 ```
 
 `GrpcAsyncClientWorker` manages the completion queue and worker threads. `GrpcServer` handles registration of async services and RPC handlers.
 
+> **Coroutine migration (in progress):** the generic (`io_blob_list_t`) stub exposes `call_unary_co()`, which bridges the gRPC completion into a `co_await`-able `sisl::async::value_awaitable` (see [Async](#async)) instead of a `std::future`. The typed `AsyncStub< ServiceT >` still offers only the future and callback overloads above; the future overloads are retained alongside the coroutine path during the migration.
+
 ### Auth Manager
 
-Token-based authentication client for gRPC channels. Fetches and caches bearer tokens, automatically refreshing before expiry.
+`GrpcTokenClient` is the interface for supplying a bearer token to gRPC channels. Subclass it and implement `get_token()`; the async client attaches the `(auth_header_key, get_token())` pair as request metadata on every call. Token fetching, caching, and refresh-before-expiry are the implementation's responsibility.
 
 ```cpp
-auto token_client = std::make_shared< sisl::GrpcTokenClient >(config);
-auto grpc_client = std::make_unique< GrpcAsyncClient >(
+class MyTokenClient : public sisl::GrpcTokenClient {
+public:
+    MyTokenClient() : sisl::GrpcTokenClient("authorization") {}
+    std::string get_token() override { return fetch_or_refresh_bearer_token(); }
+};
+
+auto token_client = std::make_shared< MyTokenClient >();
+auto grpc_client = std::make_unique< sisl::GrpcAsyncClient >(
     addr, token_client, domain, ssl_cert);
 ```
 
@@ -367,7 +406,7 @@ if (ref.decrement_testz()) { /* last reference — safe to delete */ }
 if (ref.increment_test_eq(max_outstanding)) { /* trigger backpressure */ }
 ```
 
-`decrement_testz`, `increment_test_ge`, `decrement_test_le`, and their `_with_count` variants are all provided with proper fencing. All predicate methods are `[[nodiscard]]` — silently discarding a test result is a compile error.
+`decrement_testz`, `increment_test_ge`, `decrement_test_le`, and — where the post-op value is useful — `_with_count` variants such as `increment_test_ge_with_count` are provided with proper fencing. The bare `bool`-returning predicates are `[[nodiscard]]` — silently discarding a test result is a compile error.
 
 #### enum
 
@@ -377,8 +416,9 @@ Bidirectional name ↔ value mapping for enums, including support for bit-shifte
 ENUM(MyState, uint8_t, INIT, RUNNING, STOPPED)
 
 MyState s = MyState::RUNNING;
-std::string name = enum_name(s);           // → "RUNNING"
-MyState parsed = enum_value< MyState >("STOPPED");
+std::string name = enum_name(s);                                 // enum → name: "RUNNING"
+auto val = enum_value(s);                                        // enum → underlying integer
+MyState parsed = MyStateSupport::instance().get_enum("STOPPED"); // name → enum
 ```
 
 #### thread_factory / name_thread
@@ -406,7 +446,7 @@ class AsyncRpc : public sisl::ObjLifeCounter< AsyncRpc > { ... };
 
 #### non_null_ptr
 
-A `std::unique_ptr` wrapper that guarantees the pointer is never null by default-constructing `T` when given a null or default-initialized pointer.
+`non_null_unique_ptr< T >` — a `std::unique_ptr< T >` subclass that guarantees the pointer is never null by default-constructing `T` when given a null or default-initialized pointer.
 
 #### status_factory
 
@@ -441,7 +481,8 @@ auto obj = mgr.create_object("volume", vol_name, [&](const status_request& req) 
 obj->add_child(child_obj);
 
 // Query all volumes:
-auto resp = mgr.get_status({.obj_type = "volume", .do_recurse = true});
+// designated initializers must follow declaration order (do_recurse precedes obj_type):
+auto resp = mgr.get_status({.do_recurse = true, .obj_type = "volume"});
 ```
 
 ### File Watcher
@@ -450,9 +491,10 @@ Inotify-based file change notifications with callback registration.
 
 ```cpp
 sisl::FileWatcher watcher;
+watcher.start();   // spin up the inotify thread before registering listeners
 watcher.register_listener("/etc/myapp/config.json", "cfg-reload",
     [](const std::string& path, bool deleted) {
-        if (!deleted) Settings::instance().reload(path);
+        if (!deleted) reload_config(path);
     });
 ```
 

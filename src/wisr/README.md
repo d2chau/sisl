@@ -60,7 +60,7 @@ to access T* member of the thread and modify them. When a read operation is perf
 and each T* member access write side of RCU and then swap the pointer with new and merge the results from each thread.
 
 wisr_framework expects one static member of T defined called `T::merge(T* to, const T* from)` which merges the given object to other. wisr
-already predefines and exports `wisr_vector`, `wisr_list`, `wisr_dequeue`
+already predefines and exports `wisr_vector`, `wisr_list`, `wisr_deque`
 
 It has a huge performance advantage over Mutex and Atomic and also provide atomic access for any size.
 
